@@ -627,7 +627,7 @@
         <path class="aim-logo-fill" d={AIM_RUNNING_MAN_FILL_PATH}></path>
       </svg>
     </button>
-    <div><strong>Hyprgate Instant Messenger</strong><small>{statusLine}</small></div>
+    <div><strong>Instant Messenger</strong><small>{statusLine}</small></div>
   </header>
 
   <section class="identity-strip">
