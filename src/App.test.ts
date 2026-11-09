@@ -3,6 +3,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
 import App from './App.svelte';
+import { common, dm, intent } from '@napplet/sdk';
 import { himBuddyBootstrapKey, serializeHimBuddyBootstrap } from './lib/buddy-bootstrap.js';
 
 const fixture = vi.hoisted(() => ({
@@ -41,7 +42,8 @@ vi.mock('@hyprgate/utils', () => ({
 
 vi.mock('@napplet/sdk', () => ({
   common: {
-    encodeNip19: vi.fn(),
+    encodeNip19: vi.fn().mockResolvedValue({ ok: false }),
+    decodeNip19: vi.fn(),
     follow: vi.fn(),
     follows: loadFollows,
     getProfile: vi.fn().mockResolvedValue({
@@ -203,5 +205,108 @@ describe('HIM buddy list', () => {
     ))).toBe(false);
 
     unmount(component);
+  });
+
+  describe('people and actions', () => {
+    const named = { ok: true, pubkey: fixture.buddyPubkey, profile: { display_name: 'Batched Buddy', picture: fixture.buddyPicture } };
+    const pendingPubkey = 'e'.repeat(64);
+
+    afterEach(() => {
+      vi.mocked(common.getProfile).mockResolvedValue(named);
+      vi.mocked(common.encodeNip19).mockResolvedValue({ ok: false });
+      vi.mocked(dm.status).mockResolvedValue({ available: true, ownerPubkey: fixture.ownerPubkey, implementations: [], capabilities: [] });
+      loadFollows.mockResolvedValue({ ok: true, pubkeys: [fixture.buddyPubkey] });
+    });
+
+    it('still lists a friend with no profile, under their npub', async () => {
+      vi.mocked(common.getProfile).mockResolvedValue({ ok: true, pubkey: fixture.buddyPubkey, profile: null });
+      vi.mocked(common.encodeNip19).mockResolvedValue({ ok: true, value: 'npub1buddybuddybuddybuddybuddybuddybuddy' });
+      const component = mount(App, { target: document.body });
+      await vi.waitFor(() => {
+        expect(document.querySelector('[data-testid="him-buddy"] b')?.textContent).toContain('npub1buddy');
+      });
+      unmount(component);
+    });
+
+    it('names pending people once friends have been handled, and opens their profile', async () => {
+      loadFollows.mockResolvedValue({ ok: true, pubkeys: [fixture.buddyPubkey, pendingPubkey] });
+      vi.mocked(common.getProfile).mockImplementation(async (target) => (
+        target === pendingPubkey
+          ? { ok: true, pubkey: pendingPubkey, profile: { name: 'Pending Person' } }
+          : named
+      ));
+      vi.mocked(intent.invoke).mockResolvedValue({ ok: true } as never);
+      const component = mount(App, { target: document.body });
+      const row = await vi.waitFor(() => {
+        const element = document.querySelector<HTMLElement>(`[data-testid="him-pending"][data-pubkey="${pendingPubkey}"]`);
+        expect(element?.querySelector('b')?.textContent).toBe('Pending Person');
+        return element!;
+      }, { timeout: 3_000 });
+      const lookups = vi.mocked(common.getProfile).mock.calls.map(([target]) => target);
+      expect(lookups.indexOf(fixture.buddyPubkey)).toBeLessThan(lookups.indexOf(pendingPubkey));
+      row.querySelector('button')!.click();
+      expect(intent.invoke).toHaveBeenCalledWith('napplet:profile/open', { payload: { pubkey: pendingPubkey }, behavior: { focus: true, reuse: true } });
+      unmount(component);
+    });
+
+    it('opens a profile from the avatar, and from the name of an offline friend', async () => {
+      vi.mocked(intent.invoke).mockResolvedValue({ ok: true } as never);
+      const component = mount(App, { target: document.body });
+      await vi.waitFor(() => expect(document.querySelector('[data-testid="him-buddy"] b')?.textContent).toBe('Batched Buddy'));
+      const profileCall = ['napplet:profile/open', { payload: { pubkey: fixture.buddyPubkey }, behavior: { focus: true, reuse: true } }];
+      document.querySelector<HTMLButtonElement>('[data-testid="him-buddy-avatar"]')!.click();
+      expect(intent.invoke).toHaveBeenLastCalledWith(...profileCall);
+      vi.mocked(intent.invoke).mockClear();
+      document.querySelector<HTMLButtonElement>('[data-testid="him-buddy-identity"]')!.click();
+      expect(intent.invoke).toHaveBeenLastCalledWith(...profileCall);
+      unmount(component);
+    });
+
+    it('adds a buddy without a form, says what is wrong with bad input, and follows a good npub', async () => {
+      const npub = 'npub1newbuddynewbuddynewbuddy';
+      vi.mocked(common.decodeNip19).mockResolvedValue({ ok: true, nip19Type: 'npub', hex: 'f'.repeat(64) });
+      vi.mocked(common.follow).mockResolvedValue({ ok: true });
+      const component = mount(App, { target: document.body });
+      await vi.waitFor(() => expect(document.querySelector('.aim-titlebar small')?.textContent).toBe('Offline'));
+      // The allow-scripts sandbox never fires `submit`, so this can't rely on a form.
+      expect(document.querySelector('form')).toBeNull();
+      const input = document.querySelector<HTMLInputElement>('[data-testid="him-add-buddy-input"]')!;
+      input.value = 'not a key';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      await vi.waitFor(() => expect(document.querySelector('[data-testid="him-add-error"]')?.textContent).toContain('npub or public key'));
+      expect(common.follow).not.toHaveBeenCalled();
+
+      input.value = npub;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      await vi.waitFor(() => expect(document.querySelector<HTMLButtonElement>('[data-testid="him-add-buddy"]')?.disabled).toBe(false));
+      document.querySelector<HTMLButtonElement>('[data-testid="him-add-buddy"]')!.click();
+      await vi.waitFor(() => expect(common.follow).toHaveBeenCalledWith(npub));
+      unmount(component);
+    });
+
+    it('explains what a read-only account can do and turns off what it cannot', async () => {
+      vi.mocked(dm.status).mockResolvedValue({ available: false, ownerPubkey: fixture.ownerPubkey, implementations: [], capabilities: [] });
+      const component = mount(App, { target: document.body });
+      await vi.waitFor(() => expect(document.querySelector('[data-testid="him-unavailable"]')?.textContent).toContain('signer'));
+      expect(document.querySelector('.aim-titlebar small')?.textContent).toBe('Messenger unavailable');
+      expect(document.querySelector<HTMLInputElement>('[data-testid="him-add-buddy-input"]')?.disabled).toBe(true);
+      expect(document.querySelector('[data-testid="him-go-online"]')).toBeNull();
+      unmount(component);
+    });
+
+    it('offers a direct way online when the account can chat', async () => {
+      const component = mount(App, { target: document.body });
+      const button = await vi.waitFor(() => {
+        const element = document.querySelector<HTMLButtonElement>('[data-testid="him-go-online"]');
+        expect(element).not.toBeNull();
+        return element!;
+      });
+      button.click();
+      await vi.waitFor(() => expect(document.querySelector('.aim-titlebar small')?.textContent).toBe('Online'));
+      expect(publishedPresence).toHaveBeenCalled();
+      expect(document.querySelector('[data-testid="him-go-online"]')).toBeNull();
+      unmount(component);
+    });
   });
 });
